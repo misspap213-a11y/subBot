@@ -35,7 +35,7 @@ from datetime import timezone
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, Update
 from telegram.ext import ContextTypes
 
-from .db import subscribe, set_paid, get_expiry, add_pending, resolve_pending
+from .db import subscribe, set_paid, get_expiry, add_pending, resolve_pending, get_pending_for
 from .channel import grant_access
 
 logger = logging.getLogger("subbot.payments")
@@ -366,6 +366,61 @@ async def cb_confirm_usdt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cb_confirm_sol(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _confirm_crypto(update, ctx, "sol")
+
+
+# ------------------------------------------------------------------
+# Payment proof handler — forwards tx hash / screenshot to admin
+# ------------------------------------------------------------------
+
+async def handle_payment_proof(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Catches any text or photo sent by a user who has a pending payment.
+    Forwards it straight to the admin.
+    """
+    if not ADMIN_ID:
+        return
+
+    msg     = update.message
+    chat_id = msg.chat_id
+    user    = msg.from_user
+
+    # Only act if this user actually has a pending payment
+    pending = get_pending_for(chat_id)
+    if not pending:
+        return
+
+    username_str = f"@{user.username}" if user.username else f"ID {chat_id}"
+
+    # Header so admin knows which user this is for
+    await ctx.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=(
+            f"📎 <b>Payment Proof</b>\n"
+            f"{LINE}\n"
+            f"From: {username_str}  (<code>{chat_id}</code>)\n"
+            f"Method: <b>{pending['method']}</b>"
+        ),
+        parse_mode="HTML",
+    )
+
+    # Forward the actual message (works for text, photo, document, etc.)
+    await ctx.bot.forward_message(
+        chat_id=ADMIN_ID,
+        from_chat_id=chat_id,
+        message_id=msg.message_id,
+    )
+
+    # Attach approve/deny buttons on a follow-up message
+    await ctx.bot.send_message(
+        chat_id=ADMIN_ID,
+        text="Approve or deny this payment:",
+        reply_markup=_admin_action_keyboard(chat_id),
+    )
+
+    await msg.reply_html(
+        "✅ <b>Proof received!</b> We'll confirm your payment shortly."
+    )
+    logger.info(f"Payment proof received from {user.username or chat_id}")
 
 
 # ------------------------------------------------------------------

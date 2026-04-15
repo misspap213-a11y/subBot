@@ -65,6 +65,7 @@ from src.payments import (
     cb_buy_btc, cb_buy_eth, cb_buy_usdt, cb_buy_sol,
     cb_confirm_btc, cb_confirm_eth, cb_confirm_usdt, cb_confirm_sol,
     cb_approve_payment, cb_deny_payment,
+    handle_payment_proof,
     pre_checkout,
     successful_payment,
 )
@@ -158,6 +159,12 @@ async def run():
         await kick_expired_trials(ctx.bot)
 
     tg_app.job_queue.run_repeating(_kick_job, interval=3600, first=60)
+
+    # Payment proof (tx hash or screenshot forwarded to admin)
+    tg_app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND | filters.PHOTO | filters.Document.ALL,
+        handle_payment_proof,
+    ))
 
     # Stars payment flow
     tg_app.add_handler(PreCheckoutQueryHandler(pre_checkout))
