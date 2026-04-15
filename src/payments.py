@@ -35,7 +35,7 @@ from datetime import timezone
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, Update
 from telegram.ext import ContextTypes
 
-from .db import subscribe, set_paid, get_expiry, add_pending
+from .db import subscribe, set_paid, get_expiry, add_pending, resolve_pending
 from .channel import grant_access
 
 logger = logging.getLogger("subbot.payments")
@@ -218,6 +218,13 @@ async def cb_buy_sol(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # Callback: User confirms crypto payment sent
 # ------------------------------------------------------------------
 
+def _admin_action_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"approve_pay:{chat_id}"),
+        InlineKeyboardButton("❌ Deny",    callback_data=f"deny_pay:{chat_id}"),
+    ]])
+
+
 async def _confirm_crypto(update: Update, ctx: ContextTypes.DEFAULT_TYPE, coin: str):
     query   = update.callback_query
     user    = query.from_user
@@ -227,7 +234,7 @@ async def _confirm_crypto(update: Update, ctx: ContextTypes.DEFAULT_TYPE, coin: 
     label, _ = WALLETS[coin]
     add_pending(chat_id, user.username, f"crypto_{coin}")
 
-    # Notify admin
+    # Notify admin with approve/deny buttons
     if ADMIN_ID:
         username_str = f"@{user.username}" if user.username else f"ID {chat_id}"
         await ctx.bot.send_message(
@@ -238,22 +245,114 @@ async def _confirm_crypto(update: Update, ctx: ContextTypes.DEFAULT_TYPE, coin: 
                 f"User: {username_str}  (<code>{chat_id}</code>)\n"
                 f"Coin: {label}\n"
                 f"Amount: ${PRICE_USD} USD\n"
-                f"{DLINE}\n"
-                f"Approve:  /approve {chat_id}\n"
-                f"Deny:     /deny {chat_id}"
             ),
             parse_mode="HTML",
+            reply_markup=_admin_action_keyboard(chat_id),
         )
 
     await query.edit_message_text(
-        f"✅ <b>Payment notification sent!</b>\n"
+        f"⏳ <b>Payment claim submitted!</b>\n"
         f"{LINE}\n"
-        f"We've been notified of your {label} payment.\n"
-        f"You'll receive a confirmation message here once approved.\n\n"
-        f"<i>Approval is usually within a few hours.</i>",
+        f"We've been notified of your {label} payment.\n\n"
+        f"📎 <b>Please reply to this message with your transaction hash or a screenshot</b> "
+        f"so we can verify it faster.\n\n"
+        f"<i>You'll receive a confirmation message here once approved.</i>",
         parse_mode="HTML",
     )
     logger.info(f"Crypto payment claimed: {user.username or chat_id} via {coin}")
+
+
+# ------------------------------------------------------------------
+# Admin inline approve / deny callbacks
+# ------------------------------------------------------------------
+
+async def cb_approve_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query   = update.callback_query
+    admin   = query.from_user
+
+    # Only the configured admin can tap this
+    if ADMIN_ID and admin.id != ADMIN_ID:
+        await query.answer("Not authorised.", show_alert=True)
+        return
+
+    target_id = int(query.data.split(":")[1])
+    await query.answer("Approving...")
+
+    subscribe(target_id, "", "")
+    expiry     = set_paid(target_id, DURATION_DAYS)
+    expiry_str = expiry.strftime("%d %b %Y")
+    resolve_pending(target_id, "approved")
+
+    # Update the admin message
+    original = query.message.text or ""
+    await query.edit_message_text(
+        original + f"\n\n✅ <b>Approved by you — {expiry_str}</b>",
+        parse_mode="HTML",
+    )
+
+    # Grant channel access
+    await grant_access(ctx.bot, target_id)
+
+    # Thank the user
+    try:
+        await ctx.bot.send_message(
+            chat_id=target_id,
+            text=(
+                f"🎉 <b>Payment Confirmed!</b>\n"
+                f"{LINE}\n"
+                f"Thank you! Your subscription is now active.\n"
+                f"📅 Valid until: <b>{expiry_str}</b>\n"
+                f"{LINE}\n"
+                f"Tap below to join the channel."
+            ),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📡 Get Channel Link", callback_data="get_access")
+            ]]),
+        )
+    except Exception as e:
+        logger.warning(f"Could not notify {target_id} of approval: {e}")
+
+    logger.info(f"Admin approved payment for {target_id}")
+
+
+async def cb_deny_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query   = update.callback_query
+    admin   = query.from_user
+
+    if ADMIN_ID and admin.id != ADMIN_ID:
+        await query.answer("Not authorised.", show_alert=True)
+        return
+
+    target_id = int(query.data.split(":")[1])
+    await query.answer("Denied.")
+
+    resolve_pending(target_id, "denied")
+
+    # Update the admin message
+    original = query.message.text or ""
+    await query.edit_message_text(
+        original + "\n\n❌ <b>Denied by you.</b>",
+        parse_mode="HTML",
+    )
+
+    # Notify the user
+    try:
+        await ctx.bot.send_message(
+            chat_id=target_id,
+            text=(
+                f"❌ <b>Payment Not Confirmed</b>\n"
+                f"{LINE}\n"
+                f"We couldn't verify your payment.\n\n"
+                f"Please double-check the amount and wallet address, "
+                f"then try again with /buy."
+            ),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.warning(f"Could not notify {target_id} of denial: {e}")
+
+    logger.info(f"Admin denied payment for {target_id}")
 
 
 async def cb_confirm_btc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
