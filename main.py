@@ -7,24 +7,32 @@ Runs two services on the same asyncio event loop:
        /start   — subscribe (shows Buy button when FREE_ACCESS=false)
        /stop    — unsubscribe
        /status  — check subscription + expiry
-       /buy     — send Stars invoice
+       /buy     — payment method menu (Stars / Crypto / Manual)
        /stats   — admin: subscriber counts
+       /approve — admin: approve a pending payment
+       /deny    — admin: deny a pending payment
+       /pending — admin: list pending payments
 
   2. aiohttp HTTP server
        POST /broadcast  { "message": "<HTML>" }  → fan-out to paid subscribers
        GET  /health                               → health check + subscriber count
 
 Environment variables (set in .env or Railway dashboard):
-  SUB_BOT_TOKEN      Telegram bot token (required)
-  SUB_BOT_API_KEY    Shared secret for /broadcast endpoint (recommended)
-  PORT               HTTP port — set automatically by Railway (default: 8080)
-  SUB_BOT_HOST       HTTP bind address  (default: 0.0.0.0)
-  ADMIN_CHAT_ID      Telegram chat-id allowed to run /stats
-  FREE_ACCESS        true = no payment needed  (default: false)
-  SUB_PRICE_STARS    Stars per subscription period  (default: 100)
-  SUB_DURATION_DAYS  Days per period               (default: 30)
-  CHANNEL_NAME       Display name shown in messages (default: Futures Signals)
-  DB_PATH            SQLite path  (default: subscribers.db)
+  SUB_BOT_TOKEN        Telegram bot token (required)
+  SUB_BOT_API_KEY      Shared secret for /broadcast endpoint
+  PORT                 HTTP port — set automatically by Railway (default: 8080)
+  SUB_BOT_HOST         HTTP bind address  (default: 0.0.0.0)
+  ADMIN_CHAT_ID        Telegram chat-id for admin commands + payment notifications
+  FREE_ACCESS          true = no payment needed  (default: false)
+  SUB_PRICE_STARS      Stars per subscription period  (default: 100)
+  SUB_DURATION_DAYS    Days per period               (default: 30)
+  CRYPTO_PRICE_USD     USD price shown for crypto     (default: 5)
+  CRYPTO_BTC_ADDRESS   BTC wallet address
+  CRYPTO_ETH_ADDRESS   ETH wallet address
+  CRYPTO_USDT_ADDRESS  USDT TRC-20 wallet address
+  CRYPTO_SOL_ADDRESS   SOL wallet address
+  CHANNEL_NAME         Display name shown in messages (default: Futures Signals)
+  DB_PATH              SQLite path  (default: subscribers.db)
 """
 
 import asyncio
@@ -46,7 +54,17 @@ from telegram.ext import (
 
 from src.db import init_db
 from src.handlers import cmd_start, cmd_stop, cmd_status, cmd_stats
-from src.payments import cmd_buy, cb_buy, pre_checkout, successful_payment
+from src.payments import (
+    cmd_buy,
+    cb_buy_stars,
+    cb_buy_crypto,
+    cb_buy_btc, cb_buy_eth, cb_buy_usdt, cb_buy_sol,
+    cb_confirm_btc, cb_confirm_eth, cb_confirm_usdt, cb_confirm_sol,
+    cb_buy_manual,
+    pre_checkout,
+    successful_payment,
+)
+from src.admin import cmd_approve, cmd_deny, cmd_pending
 from src.server import make_app
 
 
@@ -82,7 +100,6 @@ async def run():
     token   = os.getenv("SUB_BOT_TOKEN", "").strip()
     api_key = os.getenv("SUB_BOT_API_KEY", "").strip()
     host    = os.getenv("SUB_BOT_HOST", "0.0.0.0")
-    # Railway injects PORT; fall back to SUB_BOT_PORT then 8080
     port    = int(os.getenv("PORT") or os.getenv("SUB_BOT_PORT") or "8080")
 
     if not token:
@@ -97,21 +114,35 @@ async def run():
     # ------------------------------------------------------------------
     tg_app = Application.builder().token(token).build()
 
-    # Commands
+    # User commands
     tg_app.add_handler(CommandHandler("start",  cmd_start))
     tg_app.add_handler(CommandHandler("stop",   cmd_stop))
     tg_app.add_handler(CommandHandler("status", cmd_status))
     tg_app.add_handler(CommandHandler("buy",    cmd_buy))
     tg_app.add_handler(CommandHandler("stats",  cmd_stats))
 
-    # Inline "Buy Subscription" button callback
-    tg_app.add_handler(CallbackQueryHandler(cb_buy, pattern="^buy$"))
+    # Admin commands
+    tg_app.add_handler(CommandHandler("approve", cmd_approve))
+    tg_app.add_handler(CommandHandler("deny",    cmd_deny))
+    tg_app.add_handler(CommandHandler("pending", cmd_pending))
 
-    # Payment flow
+    # Payment method menu callbacks
+    tg_app.add_handler(CallbackQueryHandler(cmd_buy,        pattern="^buy$"))
+    tg_app.add_handler(CallbackQueryHandler(cb_buy_stars,   pattern="^buy_stars$"))
+    tg_app.add_handler(CallbackQueryHandler(cb_buy_crypto,  pattern="^buy_crypto$"))
+    tg_app.add_handler(CallbackQueryHandler(cb_buy_btc,     pattern="^buy_btc$"))
+    tg_app.add_handler(CallbackQueryHandler(cb_buy_eth,     pattern="^buy_eth$"))
+    tg_app.add_handler(CallbackQueryHandler(cb_buy_usdt,    pattern="^buy_usdt$"))
+    tg_app.add_handler(CallbackQueryHandler(cb_buy_sol,     pattern="^buy_sol$"))
+    tg_app.add_handler(CallbackQueryHandler(cb_confirm_btc,  pattern="^confirm_btc$"))
+    tg_app.add_handler(CallbackQueryHandler(cb_confirm_eth,  pattern="^confirm_eth$"))
+    tg_app.add_handler(CallbackQueryHandler(cb_confirm_usdt, pattern="^confirm_usdt$"))
+    tg_app.add_handler(CallbackQueryHandler(cb_confirm_sol,  pattern="^confirm_sol$"))
+    tg_app.add_handler(CallbackQueryHandler(cb_buy_manual,  pattern="^buy_manual$"))
+
+    # Stars payment flow
     tg_app.add_handler(PreCheckoutQueryHandler(pre_checkout))
-    tg_app.add_handler(
-        MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment)
-    )
+    tg_app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
 
     await tg_app.initialize()
     await tg_app.start()

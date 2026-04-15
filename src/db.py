@@ -4,6 +4,7 @@ Subscriber database — SQLite backed
 Tables:
   subscribers(chat_id, username, first_name, subscribed_at, active,
               subscription_expiry)
+  pending_payments(id, chat_id, username, method, requested_at, status)
 
 A subscriber receives signals when:
   • FREE_ACCESS=true  → active=1  (no payment needed)
@@ -34,6 +35,16 @@ def init_db():
                 subscribed_at        TEXT    NOT NULL,
                 active               INTEGER NOT NULL DEFAULT 1,
                 subscription_expiry  TEXT    DEFAULT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_payments (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id       INTEGER NOT NULL,
+                username      TEXT    DEFAULT '',
+                method        TEXT    NOT NULL,
+                requested_at  TEXT    NOT NULL,
+                status        TEXT    NOT NULL DEFAULT 'pending'
             )
         """)
         # Migrate existing DBs that don't have the column yet
@@ -198,3 +209,54 @@ def count_total() -> int:
     with _conn() as conn:
         row = conn.execute("SELECT COUNT(*) AS cnt FROM subscribers").fetchone()
         return row["cnt"]
+
+
+# ------------------------------------------------------------------
+# Pending payments
+# ------------------------------------------------------------------
+
+def add_pending(chat_id: int, username: str, method: str):
+    """Insert or replace a pending payment request for chat_id."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        # Remove any existing pending entry for this user first
+        conn.execute(
+            "DELETE FROM pending_payments WHERE chat_id = ? AND status = 'pending'",
+            (chat_id,),
+        )
+        conn.execute(
+            "INSERT INTO pending_payments (chat_id, username, method, requested_at, status) "
+            "VALUES (?, ?, ?, ?, 'pending')",
+            (chat_id, username or "", method, now),
+        )
+        conn.commit()
+
+
+def get_pending_all() -> list[dict]:
+    """Return all pending (unresolved) payment requests."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM pending_payments WHERE status = 'pending' ORDER BY requested_at"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_pending_for(chat_id: int) -> dict | None:
+    """Return the latest pending request for a specific chat_id."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM pending_payments WHERE chat_id = ? AND status = 'pending' "
+            "ORDER BY requested_at DESC LIMIT 1",
+            (chat_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def resolve_pending(chat_id: int, status: str):
+    """Mark pending payments for chat_id as approved/denied."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE pending_payments SET status = ? WHERE chat_id = ? AND status = 'pending'",
+            (status, chat_id),
+        )
+        conn.commit()
